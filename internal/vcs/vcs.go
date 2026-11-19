@@ -374,6 +374,28 @@ func WorktreeAtCommit(worktreePath, commit string) (bool, error) {
 	return gitvcs.WorktreeAtCommit(worktreePath, commit)
 }
 
+// AddClaimWorktree recreates a never-granted Git claim at its immutable base.
+func AddClaimWorktree(repoRoot, worktreePath, commit string) error {
+	if backendFor(repoRoot).Name() != "git" {
+		return fmt.Errorf("claim repair requires the git backend")
+	}
+	return gitvcs.AddClaimWorktree(repoRoot, worktreePath, commit)
+}
+
+// ResetClaimCheckout discards a dead attempt's entire checkout. The caller
+// must prove the authenticated claim never granted a lease, owns this slot
+// exclusively, and has no remaining processes. Ordinary reset must not use it.
+func ResetClaimCheckout(worktreePath, commit string) error {
+	name, err := WorktreeBackendNameChecked(worktreePath)
+	if err != nil {
+		return err
+	}
+	if name != "git" {
+		return fmt.Errorf("claim repair requires a git worktree")
+	}
+	return gitvcs.ResetClaimCheckout(worktreePath, commit)
+}
+
 func LocalBranchExists(repoRoot, branch string) (bool, error) {
 	if backendFor(repoRoot).Name() != "git" {
 		return false, fmt.Errorf("local branch lookup requires the git backend")

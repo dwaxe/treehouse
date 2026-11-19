@@ -137,22 +137,36 @@ func resumeClaim(repoRoot, poolDir string, state *State, opts acquireOptions) (L
 	if !c.trusted || !wt.Leased || wt.Destroying || c.Fingerprint != opts.claimFingerprint {
 		return fail("claim authentication, reservation, or acquisition options do not match")
 	}
+	// The authenticated phase is the grant history: both the prototype and
+	// fleet build leave checkout in the same state write that grants a lease.
+	// Outer lease fields alone cannot prove that no lease was ever granted.
+	if c.Phase != "complete" && (wt.LeaseID != "" || wt.LeaseHolder != acquisitionIncompleteLeaseHolder ||
+		wt.OwnerPID != 0 || wt.OwnerStartedAt != 0) {
+		return fail("claim already granted a lease or no longer exclusively owns its reservation")
+	}
+	for i, other := range state.Worktrees {
+		if i == index {
+			continue
+		}
+		samePath := filepath.Clean(other.Path) == filepath.Clean(wt.Path)
+		left, leftErr := os.Stat(wt.Path)
+		right, rightErr := os.Stat(other.Path)
+		if samePath || leftErr == nil && rightErr == nil && os.SameFile(left, right) {
+			return fail("slot has another state reservation")
+		}
+	}
 	requester, requestErr := acquisitionCommonGitDir(repoRoot)
 	original, originalErr := os.Stat(c.CommonGitDir)
 	if requestErr != nil || originalErr != nil || !os.SameFile(requester, original) {
 		return fail("claim belongs to another clone or its identity cannot be verified")
 	}
 	if _, err := os.Lstat(wt.Path); os.IsNotExist(err) && c.Phase == "checkout" {
-		// With no directory there are no slot contents to discard. Git's add
-		// handles a stale registration only for this exact path.
-		commit, err := vcs.BranchCommit(repoRoot, c.BaseBranch)
-		if err != nil || commit != c.BaseCommit {
-			return fail("original base moved or cannot be verified")
-		}
+		// Only the signed never-granted checkout phase permits recreation.
+		// Restore its immutable base even if the branch has since moved.
 		if err := os.MkdirAll(filepath.Dir(wt.Path), 0755); err != nil {
 			return fail(err.Error())
 		}
-		if err := vcs.AddWorktree(repoRoot, wt.Path, c.BaseBranch); err != nil {
+		if err := vcs.AddClaimWorktree(repoRoot, wt.Path, c.BaseCommit); err != nil {
 			return fail(err.Error())
 		}
 	}
@@ -176,17 +190,12 @@ func resumeClaim(repoRoot, poolDir string, state *State, opts acquireOptions) (L
 		return fail("worktree processes are present or cannot be verified")
 	}
 	if c.Phase == "checkout" {
-		matches, err := vcs.WorktreeAtCommit(wt.Path, c.BaseCommit)
-		if err != nil || !matches {
-			return fail("checkout is not detached at its original commit")
-		}
-		dirty, err := vcs.IsDirty(wt.Path)
-		if err != nil || dirty {
-			return fail("checkout has partial or modified tracked content")
-		}
-		unknown, err := vcs.HasUnseededBranchCreationOutput(wt.Path, nil)
-		if err != nil || unknown {
-			return fail("checkout contains unrecorded files")
+		// This claim has never granted a lease and still owns the slot alone.
+		// Every file is its dead attempt's output, including partial tracked
+		// files and ignored/untracked checkout output. Keep checkout persisted
+		// until reset succeeds, so another kill can replay the reset safely.
+		if err := vcs.ResetClaimCheckout(wt.Path, c.BaseCommit); err != nil {
+			return fail(err.Error())
 		}
 		c.Phase = "seeding"
 		if err := persistState(poolDir, *state); err != nil {

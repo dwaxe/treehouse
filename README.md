@@ -335,14 +335,21 @@ The claim stays open: fix the cause and retry with the same claim ID and options
 to rerun setup in that same slot. Successful setup grants the original claim's
 lease and completes the claim only after its reservation is checked again.
 
-This prototype repairs a clean authenticated checkout interrupted inside
-`git worktree add` and replays interrupted `post_create` setup in place. Setup
-commands must tolerate running more than once: a kill can occur after a side
-effect and before completion is recorded. A live setup child blocks repair.
-Partial or modified checkout files, unrecorded files, interrupted seeding or
-branch creation, and unverifiable ownership require inspection; retry reports
-the obstruction and preserves the slot instead of allocating another. Existing
-quarantines created without a claim ID require their existing manual recovery.
+An interrupted checkout can leave partially written or missing tracked files.
+When the authenticated claim is still in its never-granted `checkout` phase
+and exclusively owns the slot, retry resets tracked content to its recorded
+base commit and removes the dead attempt's untracked and ignored files,
+including nested repositories. This destructive repair is never used for a
+granted lease, a mismatched claim, or an unproven reservation. The original
+branch may move without changing the claim's recorded reset target.
+
+Interrupted `post_create` setup replays in place and preserves earlier setup
+output. Setup commands must tolerate running more than once: a kill can occur
+after a side effect and before completion is recorded. Live children block
+repair. Interrupted seeding or branch creation and unverifiable ownership
+still require inspection; retry reports the obstruction and preserves the
+slot instead of allocating another. Existing quarantines created without a
+claim ID require their existing manual recovery.
 
 Callers that already fetched the required refs can avoid another network operation with `--no-fetch`:
 

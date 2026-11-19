@@ -73,8 +73,9 @@ func sameRegularFile(left, right string) bool {
 	return lerr == nil && rerr == nil && l.Mode().IsRegular() && r.Mode().IsRegular() && os.SameFile(l, r)
 }
 
-// recoverHeadLock is called only while holding the reset guard. An anonymous
-// lock, including a legacy Treehouse lock, is never removed automatically.
+// recoverHeadLock is called only while holding the reset guard. Ordinary reset
+// never removes an anonymous lock, including a legacy Treehouse lock. The
+// separate never-granted claim repair may discard its dead checkout's locks.
 func recoverHeadLock(worktreePath, headPath string) error {
 	lockPath, witness := headPath+".lock", headPath+".treehouse-witness"
 	if err := headLockError(worktreePath, headPath); err != nil {

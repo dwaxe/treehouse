@@ -148,6 +148,14 @@ func ReadState(poolDir string) (State, error) {
 		wt := &s.Worktrees[i]
 		if wt.Acquisition != nil {
 			wt.Acquisition.trusted = keyErr == nil && validAcquisitionDigest(key, *wt)
+			// Seed recovery below normalizes unknown inventories to quarantine.
+			// Do not let that erase evidence that a resumable claim lost exclusive
+			// ownership or already granted a lease. Once invalid, its digest
+			// stays invalid through later List/state writes, as with tampering.
+			if (wt.Acquisition.Phase == "checkout" || wt.Acquisition.Phase == "hooks") && (!wt.Leased || wt.LeaseID != "" ||
+				wt.LeaseHolder != acquisitionIncompleteLeaseHolder || wt.OwnerPID != 0 || wt.OwnerStartedAt != 0) {
+				wt.Acquisition.trusted = false
+			}
 			if !wt.Acquisition.trusted {
 				// Keep the invalid claim visible, but never reauthenticate it on
 				// a later status/write or let automatic recovery release it.
