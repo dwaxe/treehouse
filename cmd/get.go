@@ -22,6 +22,7 @@ import (
 var (
 	getLease        bool
 	getLeaseHolder  string
+	getClaimID      string
 	getBranch       string
 	getJSON         bool
 	getNoFetch      bool
@@ -94,6 +95,7 @@ filters make the pass skip conservatively.`,
 func init() {
 	getCmd.Flags().BoolVar(&getLease, "lease", false, "Durably lease a worktree without opening a subshell; print only its path to stdout")
 	getCmd.Flags().StringVar(&getLeaseHolder, "lease-holder", "", "Optional label recorded as the lease holder (defaults to $TREEHOUSE_LEASE_HOLDER)")
+	getCmd.Flags().StringVar(&getClaimID, "claim-id", "", "Idempotency key for a durable Git acquisition; repeat the same ID and options to resume it")
 	getCmd.Flags().BoolVar(&getJSON, "json", false, "Print lease allocation as JSON (requires --lease)")
 	getCmd.Flags().BoolVar(&getNoFetch, "no-fetch", false, "Skip fetching origin before acquiring; use existing local refs")
 	getCmd.Flags().StringVarP(&getBranch, "branch", "b", "", "Create and check out a new Git branch at the acquired commit (fails if it already exists)")
@@ -114,6 +116,9 @@ func getRunE(cmd *cobra.Command, args []string) error {
 	}
 	if getJSON && !getLease {
 		return fmt.Errorf("--json requires --lease")
+	}
+	if getClaimID != "" && !getLease {
+		return fmt.Errorf("--claim-id requires --lease")
 	}
 
 	var manifest []byte
@@ -159,6 +164,7 @@ func getRunE(cmd *cobra.Command, args []string) error {
 	}
 
 	acquireOpts := pool.AcquireOptions{
+		ClaimID:         getClaimID,
 		SkipFetch:       getNoFetch,
 		Branch:          getBranch,
 		BaseBranch:      resolveRequestedBase(cfg),

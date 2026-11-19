@@ -13,7 +13,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/kunchenguid/treehouse/v3/internal/hooks"
 	"github.com/kunchenguid/treehouse/v3/internal/process"
 	"github.com/kunchenguid/treehouse/v3/internal/vcs"
 )
@@ -107,6 +106,9 @@ type LeaseInfo struct {
 
 // AcquireOptions controls optional acquisition behavior.
 type AcquireOptions struct {
+	// ClaimID opts a durable lease into idempotent acquisition retries. Use a
+	// unique ID per task and repeat it until return; holder remains a label.
+	ClaimID string
 	// SkipFetch uses the repository's existing local refs instead of fetching
 	// origin before acquiring a worktree.
 	SkipFetch bool
@@ -156,7 +158,9 @@ type acquireOptions struct {
 	// default short-lived owner reservation.
 	lease bool
 	// leaseHolder is an optional label stored with a lease.
-	leaseHolder string
+	leaseHolder      string
+	claimID          string
+	claimFingerprint string
 	// hookStdout/hookStderr receive post-create hook output. Lease mode routes
 	// hook stdout to stderr so it cannot contaminate machine-readable CLI output.
 	hookStdout io.Writer
@@ -173,6 +177,7 @@ func Acquire(repoRoot, poolDir string, poolSize int, postCreate []string) (strin
 // AcquireWithOptions reserves a clean worktree with optional acquisition behavior.
 func AcquireWithOptions(repoRoot, poolDir string, poolSize int, postCreate []string, options AcquireOptions) (string, error) {
 	acquired, err := acquire(repoRoot, poolDir, poolSize, postCreate, acquireOptions{
+		claimID:         options.ClaimID,
 		skipFetch:       options.SkipFetch,
 		baseBranch:      options.BaseBranch,
 		branch:          options.Branch,
@@ -214,6 +219,7 @@ func AcquireLeaseInfoWithOptions(repoRoot, poolDir string, poolSize int, postCre
 		uniqueLeaf:      options.UniqueLeaf,
 		lease:           true,
 		leaseHolder:     holder,
+		claimID:         options.ClaimID,
 		hookStdout:      os.Stderr,
 		hookStderr:      os.Stderr,
 	})
@@ -411,7 +417,28 @@ func acquisitionCommonGitDir(dir string) (os.FileInfo, error) {
 	return os.Stat(commonDir)
 }
 
-func acquire(repoRoot, poolDir string, poolSize int, postCreate []string, opts acquireOptions) (LeaseInfo, error) {
+func acquireOnce(repoRoot, poolDir string, poolSize int, postCreate []string, opts acquireOptions) (LeaseInfo, error) {
+	if opts.claimID != "" {
+		var existing LeaseInfo
+		var found, runHooks bool
+		err := WithStateLock(poolDir, func() error {
+			state, err := ReadState(poolDir)
+			if err != nil {
+				return err
+			}
+			existing, found, runHooks, err = resumeClaim(repoRoot, poolDir, &state, opts)
+			return err
+		})
+		if err != nil {
+			return LeaseInfo{}, err
+		}
+		if found {
+			if runHooks {
+				return runAcquisitionHooks(poolDir, existing, postCreate, opts)
+			}
+			return existing, nil
+		}
+	}
 	// Before the fetch and before any slot is inspected, so a template that is
 	// wrong on its own text costs nothing. The placement rules need a slot name
 	// and run under the state lock below.
@@ -450,22 +477,28 @@ func acquire(repoRoot, poolDir string, poolSize int, postCreate []string, opts a
 	// An unverifiable requester identity disables reuse, not allocation.
 	commonDir, identityErr := acquisitionCommonGitDir(repoRoot)
 
-	if opts.branch != "" {
-		exists, err := vcs.LocalBranchExists(repoRoot, opts.branch)
-		if err != nil {
-			return LeaseInfo{}, fmt.Errorf("failed to check branch %q: %w", opts.branch, err)
-		}
-		if exists {
-			return LeaseInfo{}, fmt.Errorf("branch %q already exists", opts.branch)
-		}
-	}
-
 	var acquired LeaseInfo
+	runPostCreate := true
 
 	err = WithStateLock(poolDir, func() error {
 		state, err := ReadState(poolDir)
 		if err != nil {
 			return err
+		}
+		if lease, found, runHooks, err := resumeClaim(repoRoot, poolDir, &state, opts); found {
+			acquired, runPostCreate = lease, runHooks
+			return err
+		}
+		// A retry with --branch may already own that branch. Only a new
+		// acquisition must reject an existing name.
+		if opts.branch != "" {
+			exists, err := vcs.LocalBranchExists(repoRoot, opts.branch)
+			if err != nil {
+				return fmt.Errorf("failed to check branch %q: %w", opts.branch, err)
+			}
+			if exists {
+				return fmt.Errorf("branch %q already exists", opts.branch)
+			}
 		}
 
 		state, err = healState(poolDir, state)
@@ -570,7 +603,22 @@ func acquire(repoRoot, poolDir string, poolSize int, postCreate []string, opts a
 			if !wt.SeedInventoryKnown {
 				seededPaths = nil
 			}
+			if opts.claimID != "" {
+				pending := &state.Worktrees[i]
+				if err := beginClaim(repoRoot, pending, opts, branch, resetRef); err != nil {
+					return err
+				}
+				pending.Leased = true
+				pending.LeaseHolder = acquisitionIncompleteLeaseHolder
+				pending.LeasedAt = time.Now()
+				if err := persistState(poolDir, state); err != nil {
+					return err
+				}
+			}
 			if err := vcs.ResetWorktreeToRefWithSeededPaths(wt.Path, resetRef, head, true, seededPaths); err != nil {
+				if opts.claimID != "" {
+					return err
+				}
 				if errors.Is(err, vcs.ErrWorktreeLocked) {
 					lockErrors = append(lockErrors, err.Error())
 				}
@@ -581,6 +629,7 @@ func acquire(repoRoot, poolDir string, poolSize int, postCreate []string, opts a
 			state.Worktrees[i].Leased = true
 			state.Worktrees[i].LeaseHolder = acquisitionIncompleteLeaseHolder
 			state.Worktrees[i].LeasedAt = time.Now()
+			claimPhase(&state.Worktrees[i], "seeding")
 			if err := persistState(poolDir, state); err != nil {
 				return err
 			}
@@ -647,6 +696,7 @@ func acquire(repoRoot, poolDir string, poolSize int, postCreate []string, opts a
 					return fmt.Errorf("failed to create branch %q in %s: %w", opts.branch, wt.Path, branchErr)
 				}
 			}
+			claimPhase(&state.Worktrees[i], "hooks")
 			acquired = leaseInfoFromEntry(state.Worktrees[i], branch)
 			return persistState(poolDir, state)
 		}
@@ -683,7 +733,7 @@ func acquire(repoRoot, poolDir string, poolSize int, postCreate []string, opts a
 		}
 
 		var expectedCommit string
-		if opts.branch != "" {
+		if opts.branch != "" || opts.claimID != "" {
 			expectedCommit, err = vcs.BranchCommit(repoRoot, branch)
 			if err != nil {
 				return fmt.Errorf("failed to resolve base commit for branch %q: %w", opts.branch, err)
@@ -702,6 +752,9 @@ func acquire(repoRoot, poolDir string, poolSize int, postCreate []string, opts a
 			LeaseHolder: acquisitionIncompleteLeaseHolder,
 			LeasedAt:    time.Now(),
 		}
+		if err := beginClaim(repoRoot, &entry, opts, branch, expectedCommit); err != nil {
+			return err
+		}
 		state.Worktrees = append(state.Worktrees, entry)
 		if err := persistState(poolDir, state); err != nil {
 			return err
@@ -714,6 +767,13 @@ func acquire(repoRoot, poolDir string, poolSize int, postCreate []string, opts a
 				}
 			}
 			return fmt.Errorf("failed to create worktree: %w", err)
+		}
+		if opts.claimID != "" {
+			claimPhase(&entry, "seeding")
+			state.Worktrees[len(state.Worktrees)-1] = entry
+			if err := persistState(poolDir, state); err != nil {
+				return err
+			}
 		}
 		seededPaths, err := seedWorktree(repoRoot, wtPath, opts.includeManifest)
 		if err != nil {
@@ -812,47 +872,16 @@ func acquire(repoRoot, poolDir string, poolSize int, postCreate []string, opts a
 			}
 		}
 
+		claimPhase(&state.Worktrees[len(state.Worktrees)-1], "hooks")
 		entry = state.Worktrees[len(state.Worktrees)-1]
 		acquired = leaseInfoFromEntry(entry, branch)
-		return nil
+		return persistState(poolDir, state)
 	})
 	if err != nil {
 		return LeaseInfo{}, err
 	}
-	// Keep the durable incomplete-acquisition quarantine through setup, for
-	// both fresh and recycled slots. Hooks run outside the state lock so they
-	// can inspect the pool or acquire another slot without deadlocking.
-	if err := hooks.RunRequired(postCreate, acquired.Path, opts.hookStdout, opts.hookStderr); err != nil {
-		return LeaseInfo{}, fmt.Errorf("post_create failed in %s; worktree quarantined for inspection: %w", acquired.Path, err)
-	}
-
-	err = WithStateLock(poolDir, func() error {
-		state, err := ReadState(poolDir)
-		if err != nil {
-			return err
-		}
-		for i := range state.Worktrees {
-			wt := &state.Worktrees[i]
-			if wt.Path != acquired.Path {
-				continue
-			}
-			// An explicit return or destroy during setup must not let this
-			// acquisition overwrite a newer reservation.
-			if wt.Destroying || !wt.Leased || wt.LeaseID != acquired.LeaseID ||
-				wt.LeaseHolder != acquisitionIncompleteLeaseHolder || !wt.LeasedAt.Equal(acquired.LeasedAt) {
-				break
-			}
-			clearLease(wt)
-			if err := markAcquired(wt, opts); err != nil {
-				return err
-			}
-			acquired = leaseInfoFromEntry(*wt, branch)
-			return persistState(poolDir, state)
-		}
-		return fmt.Errorf("acquisition reservation changed during post_create in %s", acquired.Path)
-	})
-	if err != nil {
-		return LeaseInfo{}, err
+	if runPostCreate {
+		return runAcquisitionHooks(poolDir, acquired, postCreate, opts)
 	}
 	return acquired, nil
 }
@@ -924,10 +953,21 @@ func resolveBaseBranch(repoRoot, requested string) (string, error) {
 // markAcquired stamps an acquired worktree entry: a durable lease in lease mode,
 // otherwise the default short-lived owner reservation.
 func markAcquired(wt *WorktreeEntry, opts acquireOptions) error {
+	if opts.claimID == "" {
+		wt.Acquisition = nil
+		wt.AcquisitionDigest = ""
+	}
 	if opts.lease {
 		leaseID, err := newLeaseID()
 		if err != nil {
 			return err
+		}
+		if opts.claimID != "" {
+			if wt.Acquisition == nil || !wt.Acquisition.trusted || wt.Acquisition.ID != opts.claimID {
+				return fmt.Errorf("acquisition claim identity changed")
+			}
+			leaseID = wt.Acquisition.LeaseID
+			claimPhase(wt, "complete")
 		}
 		wt.Leased = true
 		wt.LeaseID = leaseID
@@ -1565,7 +1605,7 @@ func healState(poolDir string, state State) (State, error) {
 	}
 	var healed []WorktreeEntry
 	for _, wt := range state.Worktrees {
-		if _, err := os.Stat(wt.Path); err == nil {
+		if _, err := os.Stat(wt.Path); err == nil || wt.Acquisition != nil {
 			if wt.OwnerPID != 0 && !ownerAlive(wt) {
 				wt.OwnerPID = 0
 				wt.OwnerStartedAt = 0
@@ -1712,6 +1752,8 @@ func releaseEntry(wt *WorktreeEntry) {
 	wt.OwnerPID = 0
 	wt.OwnerStartedAt = 0
 	clearLease(wt)
+	wt.Acquisition = nil
+	wt.AcquisitionDigest = ""
 	setSeedInventory(wt, nil, true)
 }
 

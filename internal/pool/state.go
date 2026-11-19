@@ -25,6 +25,10 @@ type WorktreeEntry struct {
 	Destroying     bool      `json:"destroying,omitempty"`
 	OwnerPID       int32     `json:"owner_pid,omitempty"`
 	OwnerStartedAt int64     `json:"owner_started_at,omitempty"`
+	// Acquisition authenticates an opt-in retry independently of seed state,
+	// which is necessarily unknown while checkout or seeding is running.
+	Acquisition       *acquisitionClaim `json:"acquisition,omitempty"`
+	AcquisitionDigest string            `json:"acquisition_digest,omitempty"`
 	// Leased marks a worktree as durably reserved by an external consumer that
 	// keeps no live process inside it. Unlike OwnerPID/OwnerStartedAt (which are
 	// process-derived and self-heal when the owner dies), a lease persists until
@@ -142,6 +146,16 @@ func ReadState(poolDir string) (State, error) {
 	legacy := s.Version == 0 && (keyErr == nil || errors.Is(keyErr, fs.ErrNotExist))
 	for i := range s.Worktrees {
 		wt := &s.Worktrees[i]
+		if wt.Acquisition != nil {
+			wt.Acquisition.trusted = keyErr == nil && validAcquisitionDigest(key, *wt)
+			if !wt.Acquisition.trusted {
+				// Keep the invalid claim visible, but never reauthenticate it on
+				// a later status/write or let automatic recovery release it.
+				wt.Leased = true
+				wt.LeaseHolder = acquisitionIncompleteLeaseHolder
+				wt.AcquisitionDigest = ""
+			}
+		}
 		if legacy && !hasSeedState(*wt) {
 			setSeedInventory(wt, nil, true)
 			continue
@@ -150,7 +164,9 @@ func ReadState(poolDir string) (State, error) {
 			wt.Leased = true
 			// An interrupted acquisition has a known cause and must not be
 			// mistaken for lost state or automatically released during recovery.
-			if wt.LeaseHolder != acquisitionIncompleteLeaseHolder {
+			if wt.Acquisition != nil {
+				wt.LeaseHolder = acquisitionIncompleteLeaseHolder
+			} else if wt.LeaseHolder != acquisitionIncompleteLeaseHolder {
 				wt.LeaseHolder = RecoveredLeaseHolder
 			}
 			wt.SeededPaths = nil
@@ -358,7 +374,7 @@ func prepareStateForWrite(poolDir string, s State) (State, error) {
 	key, err := ensureStateKey(poolDir)
 	if err != nil {
 		for i := range s.Worktrees {
-			if s.Worktrees[i].SeedInventoryKnown {
+			if s.Worktrees[i].SeedInventoryKnown || s.Worktrees[i].Acquisition != nil {
 				return State{}, err
 			}
 		}
@@ -372,6 +388,11 @@ func prepareStateForWrite(poolDir string, s State) (State, error) {
 	}
 	for i := range s.Worktrees {
 		wt := &s.Worktrees[i]
+		if wt.Acquisition != nil && wt.Acquisition.trusted {
+			wt.AcquisitionDigest = acquisitionDigest(key, *wt)
+		} else {
+			wt.AcquisitionDigest = ""
+		}
 		if wt.SeedInventoryKnown {
 			if !validSeedInventory(wt.SeededPaths) {
 				return State{}, fmt.Errorf("invalid seeded path inventory")

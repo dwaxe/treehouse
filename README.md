@@ -192,6 +192,7 @@ You can instead keep the pool [inside the project](#in-project-storage) with `--
 | --------- | --------- | --------------------------------- |
 | `get`     | `--lease` | Durably lease the worktree without opening a subshell; print only its path to stdout |
 | `get`     | `--lease-holder` | Optional label recorded as the lease holder (defaults to `$TREEHOUSE_LEASE_HOLDER`) |
+| `get`     | `--claim-id` | Opt in to retrying the same durable Git acquisition without consuming another slot |
 | `get`     | `--json` | Print `path`, `lease_id`, `lease_holder`, `leased_at`, and `base_branch` as JSON (requires `--lease`) |
 | `get`     | `-b`, `--branch` | Create and check out a new Git branch at the acquired commit; fails if it already exists or its name is invalid |
 | `get`     | `--base` | Branch to cut this worktree from, overriding `base_branch` in config |
@@ -314,6 +315,34 @@ Every acquisition receives a new random `lease_id`, including reacquiring the sa
 treehouse get --lease --lease-holder automation-A --json
 # {"path":"...","lease_id":"...","lease_holder":"automation-A","leased_at":"...","base_branch":"main"}
 ```
+
+For retryable Git acquisitions, supply a unique `--claim-id` for the task on
+the first attempt and repeat that ID with identical acquisition options, holder,
+and setup hooks on retries:
+
+```sh
+treehouse get --lease --claim-id task-123 --lease-holder automation-A --json
+```
+
+The claim is recorded before checkout. A retry completes its interrupted slot
+before allocating another, retains the original lease ID, and returns an already
+completed lease without resetting its contents or rerunning setup. Holder labels
+alone keep their existing behavior. Return clears the claim with the lease.
+
+Setup is required before any new lease is granted, including a resumed claim.
+If setup fails, `get` fails and leaves the slot blocked with no caller lease.
+The claim stays open: fix the cause and retry with the same claim ID and options
+to rerun setup in that same slot. Successful setup grants the original claim's
+lease and completes the claim only after its reservation is checked again.
+
+This prototype repairs a clean authenticated checkout interrupted inside
+`git worktree add` and replays interrupted `post_create` setup in place. Setup
+commands must tolerate running more than once: a kill can occur after a side
+effect and before completion is recorded. A live setup child blocks repair.
+Partial or modified checkout files, unrecorded files, interrupted seeding or
+branch creation, and unverifiable ownership require inspection; retry reports
+the obstruction and preserves the slot instead of allocating another. Existing
+quarantines created without a claim ID require their existing manual recovery.
 
 Callers that already fetched the required refs can avoid another network operation with `--no-fetch`:
 
@@ -757,7 +786,7 @@ pre_destroy = ["./scripts/teardown.sh"]
 - `pre_destroy` runs before a worktree is removed by `treehouse destroy <path> --yes`, `treehouse destroy <pool> --all --yes`, or prune deletion commands such as `treehouse prune --yes` and `treehouse prune --prune-orphans --yes`.
 
 Commands in each list run sequentially in the worktree directory, via the OS shell (`/bin/sh -c` on Linux/macOS, `%COMSPEC% /c` on Windows).
-If a `post_create` command exits non-zero, `get` fails with the command and exit code, stops the remaining setup commands, and grants no lease or subshell. The worktree stays quarantined as an incomplete acquisition for inspection, including any files setup wrote. This applies to both new and reused slots; see [quarantine recovery](#recovering-missing-pool-state) before acquiring the worktree again.
+If a `post_create` command exits non-zero, `get` fails with the command and exit code, stops the remaining setup commands, and grants no lease or subshell. The worktree stays quarantined as an incomplete acquisition for inspection, including any files setup wrote. This applies to new, reused, and resumed slots. With `--claim-id`, the claim stays open so the same claim can rerun setup after its cause is fixed. Without a claim, see [quarantine recovery](#recovering-missing-pool-state) before acquiring the worktree again.
 Failing `pre_destroy` commands are logged and do not stop later commands or fail `destroy` or `prune`.
 
 ## Development
